@@ -401,7 +401,10 @@ async def get_twitter_auth_url(current_user: dict = Depends(get_current_user)):
     if not consumer_key or not consumer_secret:
         raise HTTPException(status_code=500, detail="Twitter API credentials not configured. Please set TWITTER_CLIENT_ID and TWITTER_CLIENT_SECRET in .env file.")
     
-    callback_url = "https://xsaas.preview.emergentagent.com/twitter-callback"
+    callback_url = os.environ.get('TWITTER_CALLBACK_URL', 'https://backendai-29f4.onrender.com/api/twitter/callback')
+    
+    if not callback_url:
+        raise HTTPException(status_code=500, detail="Twitter callback URL not configured. Please set TWITTER_CALLBACK_URL in .env file.")
     
     auth = OAuth1(consumer_key, consumer_secret, callback_uri=callback_url)
     request_token_url = "https://api.twitter.com/oauth/request_token"
