@@ -14,7 +14,7 @@ import bcrypt
 import jwt
 from authlib.integrations.starlette_client import OAuth
 from starlette.config import Config
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from openai import AsyncOpenAI
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -49,6 +49,21 @@ api_router = APIRouter(prefix="/api")
 
 # Initialize scheduler
 scheduler = AsyncIOScheduler()
+
+# Initialize OpenAI client
+openai_client = None
+
+def get_openai_client():
+    global openai_client
+    if openai_client is None:
+        api_key = os.environ.get('OPENAI_API_KEY')
+        if not api_key or api_key == 'your-openai-api-key-here':
+            raise HTTPException(
+                status_code=500, 
+                detail="OpenAI API key not configured. Please set OPENAI_API_KEY in .env file"
+            )
+        openai_client = AsyncOpenAI(api_key=api_key)
+    return openai_client
 
 # ===== Models =====
 class UserCreate(BaseModel):
@@ -160,7 +175,13 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 
 # ===== AI Tweet Generation =====
 async def generate_tweet(content_config: dict, user_id: str) -> str:
-    api_key = os.environ.get('EMERGENT_LLM_KEY')
+    """
+    Generate a tweet using OpenAI's API directly.
+    
+    This function uses the OpenAI SDK to generate tweets based on user's content configuration.
+    It sends a structured prompt to GPT-4 to create engaging, character-limited tweets.
+    """
+    client = get_openai_client()
     
     length_map = {
         "short": "50-100 characters",
@@ -168,7 +189,7 @@ async def generate_tweet(content_config: dict, user_id: str) -> str:
         "long": "200-280 characters"
     }
     
-    system_message = f"You are an expert social media content creator. Generate engaging tweets that are exactly within Twitter's 280 character limit."
+    system_message = "You are an expert social media content creator. Generate engaging tweets that are exactly within Twitter's 280 character limit."
     
     user_prompt = f"""Generate a tweet about: {content_config['topic']}
     
@@ -183,20 +204,41 @@ Rules:
 3. No quotes around the tweet
 4. Just return the tweet text, nothing else"""
     
-    chat = LlmChat(
-        api_key=api_key,
-        session_id=f"tweet_gen_{user_id}_{datetime.now(timezone.utc).isoformat()}",
-        system_message=system_message
-    ).with_model("openai", "gpt-5.1")
-    
-    user_message = UserMessage(text=user_prompt)
-    response = await chat.send_message(user_message)
-    
-    tweet = response.strip()
-    if len(tweet) > 280:
-        tweet = tweet[:277] + "..."
-    
-    return tweet
+    try:
+        # Call OpenAI API with GPT-4 model
+        response = await client.chat.completions.create(
+            model="gpt-4",  # Using GPT-4 for high-quality content generation
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,  # Balanced creativity
+            max_tokens=100,   # Sufficient for a tweet
+            top_p=1.0,
+            frequency_penalty=0.5,  # Reduce repetition
+            presence_penalty=0.3    # Encourage variety
+        )
+        
+        tweet = response.choices[0].message.content.strip()
+        
+        # Remove any quotes that might wrap the tweet
+        if tweet.startswith('"') and tweet.endswith('"'):
+            tweet = tweet[1:-1]
+        if tweet.startswith("'") and tweet.endswith("'"):
+            tweet = tweet[1:-1]
+        
+        # Ensure tweet is within character limit
+        if len(tweet) > 280:
+            tweet = tweet[:277] + "..."
+        
+        return tweet
+        
+    except Exception as e:
+        logging.error(f"OpenAI API error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate tweet: {str(e)}"
+        )
 
 # ===== Twitter API Functions =====
 def post_tweet_to_twitter(oauth_token: str, oauth_token_secret: str, tweet_text: str) -> dict:
@@ -338,7 +380,7 @@ async def get_twitter_auth_url(current_user: dict = Depends(get_current_user)):
     if not consumer_key or not consumer_secret:
         raise HTTPException(status_code=500, detail="Twitter API credentials not configured. Please set TWITTER_CLIENT_ID and TWITTER_CLIENT_SECRET in .env file.")
     
-    callback_url = "https://x-content-hub-2.preview.emergentagent.com/twitter-callback"
+    callback_url = "https://xsaas.preview.emergentagent.com/twitter-callback"
     
     auth = OAuth1(consumer_key, consumer_secret, callback_uri=callback_url)
     request_token_url = "https://api.twitter.com/oauth/request_token"
