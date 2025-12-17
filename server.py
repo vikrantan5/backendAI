@@ -44,6 +44,27 @@ oauth = OAuth(config)
 # Create the main app without a prefix
 app = FastAPI()
 
+
+
+# =======================
+# Health check (Root)
+# =======================
+@app.get("/")
+def health():
+    return {
+        "status": "ok",
+        "service": "Backend AI",
+        "message": "API is running"
+    }
+
+# =======================
+# Favicon fix (avoid 404)
+# =======================
+@app.get("/favicon.ico")
+def favicon():
+    return {}
+
+
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
