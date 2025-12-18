@@ -12,14 +12,14 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
-from authlib.integrations.starlette_client import OAuth
-from starlette.config import Config
 from openai import AsyncOpenAI
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import requests
-from requests_oauthlib import OAuth1
+import hashlib
+import base64
+import secrets
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -36,10 +36,6 @@ JWT_EXPIRATION_HOURS = 24
 
 # Security
 security = HTTPBearer()
-
-# OAuth Configuration
-config = Config(environ=os.environ)
-oauth = OAuth(config)
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -261,19 +257,30 @@ Rules:
             detail=f"Failed to generate tweet: {str(e)}"
         )
 
+# ===== Twitter OAuth 2.0 Helper Functions =====
+def generate_pkce_pair():
+    """Generate PKCE code verifier and challenge for OAuth 2.0"""
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8')
+    code_verifier = code_verifier.replace('=', '').replace('+', '-').replace('/', '_')
+    
+    code_challenge = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+    code_challenge = base64.urlsafe_b64encode(code_challenge).decode('utf-8')
+    code_challenge = code_challenge.replace('=', '').replace('+', '-').replace('/', '_')
+    
+    return code_verifier, code_challenge
+
 # ===== Twitter API Functions =====
-def post_tweet_to_twitter(oauth_token: str, oauth_token_secret: str, tweet_text: str) -> dict:
-    consumer_key = os.environ.get('TWITTER_CLIENT_ID')
-    consumer_secret = os.environ.get('TWITTER_CLIENT_SECRET')
-    
-    if not consumer_key or not consumer_secret:
-        raise HTTPException(status_code=500, detail="Twitter API credentials not configured")
-    
-    auth = OAuth1(consumer_key, consumer_secret, oauth_token, oauth_token_secret)
+def post_tweet_to_twitter(access_token: str, tweet_text: str) -> dict:
+    """Post tweet using OAuth 2.0 Bearer token"""
     url = "https://api.twitter.com/2/tweets"
     
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    
     payload = {"text": tweet_text}
-    response = requests.post(url, json=payload, auth=auth)
+    response = requests.post(url, json=payload, headers=headers)
     
     if response.status_code == 201:
         return response.json()
@@ -301,8 +308,7 @@ async def process_scheduled_posts():
                 
                 try:
                     twitter_response = post_tweet_to_twitter(
-                        twitter_account['oauth_token'],
-                        twitter_account['oauth_token_secret'],
+                        twitter_account['access_token'],
                         tweet_text
                     )
                     
@@ -392,113 +398,160 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         created_at=current_user["created_at"]
     )
 
-# ===== Twitter OAuth Routes =====
+# ===== Twitter OAuth 2.0 Routes =====
 @api_router.get("/twitter/auth-url")
 async def get_twitter_auth_url(current_user: dict = Depends(get_current_user)):
-    consumer_key = os.environ.get('TWITTER_CLIENT_ID')
-    consumer_secret = os.environ.get('TWITTER_CLIENT_SECRET')
+    client_id = os.environ.get('TWITTER_CLIENT_ID')
+    callback_url = os.environ.get('TWITTER_CALLBACK_URL')
     
-    if not consumer_key or not consumer_secret:
-        raise HTTPException(status_code=500, detail="Twitter API credentials not configured. Please set TWITTER_CLIENT_ID and TWITTER_CLIENT_SECRET in .env file.")
-    
-    callback_url = os.environ.get('TWITTER_CALLBACK_URL', 'https://backendai-29f4.onrender.com/api/twitter/callback')
+    if not client_id:
+        raise HTTPException(status_code=500, detail="Twitter API credentials not configured. Please set TWITTER_CLIENT_ID in .env file.")
     
     if not callback_url:
         raise HTTPException(status_code=500, detail="Twitter callback URL not configured. Please set TWITTER_CALLBACK_URL in .env file.")
     
-    auth = OAuth1(consumer_key, consumer_secret, callback_uri=callback_url)
-    request_token_url = "https://api.twitter.com/oauth/request_token"
-    
     try:
-        response = requests.post(request_token_url, auth=auth)
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Failed to get request token: {response.text}")
+        # Generate PKCE code verifier and challenge
+        code_verifier, code_challenge = generate_pkce_pair()
         
-        credentials = dict(item.split('=') for item in response.text.split('&'))
-        oauth_token = credentials.get('oauth_token')
-        oauth_token_secret = credentials.get('oauth_token_secret')
+        # Generate random state for CSRF protection
+        state = secrets.token_urlsafe(32)
         
+        # Store PKCE verifier and state for this user
+        await db.twitter_temp_tokens.delete_many({"user_id": current_user["id"]})
         await db.twitter_temp_tokens.insert_one({
             "user_id": current_user["id"],
-            "oauth_token": oauth_token,
-            "oauth_token_secret": oauth_token_secret,
+            "code_verifier": code_verifier,
+            "state": state,
             "created_at": datetime.now(timezone.utc).isoformat()
         })
         
-        auth_url = f"https://api.twitter.com/oauth/authenticate?oauth_token={oauth_token}"
-        return {"auth_url": auth_url}
+        # Build OAuth 2.0 authorization URL
+        scopes = "tweet.read tweet.write users.read offline.access"
+        auth_url = (
+            f"https://twitter.com/i/oauth2/authorize"
+            f"?response_type=code"
+            f"&client_id={client_id}"
+            f"&redirect_uri={callback_url}"
+            f"&scope={scopes}"
+            f"&state={state}"
+            f"&code_challenge={code_challenge}"
+            f"&code_challenge_method=S256"
+        )
+        
+        return {"auth_url": auth_url, "state": state}
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Twitter OAuth error: {str(e)}")
 
-@api_router.post("/twitter/callback")
-async def twitter_callback(oauth_token: str, oauth_verifier: str, current_user: dict = Depends(get_current_user)):
-    consumer_key = os.environ.get('TWITTER_CLIENT_ID')
-    consumer_secret = os.environ.get('TWITTER_CLIENT_SECRET')
+@api_router.get("/twitter/callback")
+async def twitter_callback(code: str, state: str, current_user: dict = Depends(get_current_user)):
+    """
+    OAuth 2.0 callback endpoint
+    Twitter redirects here after user authorization with code and state
+    """
+    client_id = os.environ.get('TWITTER_CLIENT_ID')
+    client_secret = os.environ.get('TWITTER_CLIENT_SECRET')
+    callback_url = os.environ.get('TWITTER_CALLBACK_URL')
     
-    temp_token = await db.twitter_temp_tokens.find_one({"oauth_token": oauth_token}, {"_id": 0})
+    # Retrieve stored PKCE verifier and state
+    temp_token = await db.twitter_temp_tokens.find_one({"user_id": current_user["id"]}, {"_id": 0})
     if not temp_token:
-        raise HTTPException(status_code=400, detail="Invalid OAuth token")
+        raise HTTPException(status_code=400, detail="Invalid OAuth session. Please try connecting again.")
     
-    auth = OAuth1(
-        consumer_key,
-        consumer_secret,
-        temp_token['oauth_token'],
-        temp_token['oauth_token_secret'],
-        verifier=oauth_verifier
-    )
+    # Verify state to prevent CSRF attacks
+    if temp_token.get('state') != state:
+        raise HTTPException(status_code=400, detail="Invalid state parameter. Possible CSRF attack.")
     
-    access_token_url = "https://api.twitter.com/oauth/access_token"
-    response = requests.post(access_token_url, auth=auth)
+    code_verifier = temp_token.get('code_verifier')
     
-    if response.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to get access token")
+    # Exchange authorization code for access token
+    token_url = "https://api.twitter.com/2/oauth2/token"
     
-    credentials = dict(item.split('=') for item in response.text.split('&'))
+    # Prepare Basic Auth header
+    auth_string = f"{client_id}:{client_secret}"
+    auth_bytes = auth_string.encode('utf-8')
+    auth_b64 = base64.b64encode(auth_bytes).decode('utf-8')
     
-    auth = OAuth1(
-        consumer_key,
-        consumer_secret,
-        credentials['oauth_token'],
-        credentials['oauth_token_secret']
-    )
-    
-    user_info_response = requests.get(
-        "https://api.twitter.com/1.1/account/verify_credentials.json",
-        auth=auth
-    )
-    
-    if user_info_response.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to verify credentials")
-    
-    twitter_user = user_info_response.json()
-    
-    twitter_account_doc = {
-        "user_id": current_user["id"],
-        "twitter_id": twitter_user['id_str'],
-        "screen_name": twitter_user['screen_name'],
-        "name": twitter_user['name'],
-        "profile_image_url": twitter_user['profile_image_url_https'],
-        "oauth_token": credentials['oauth_token'],
-        "oauth_token_secret": credentials['oauth_token_secret'],
-        "connected_at": datetime.now(timezone.utc).isoformat()
+    headers = {
+        "Authorization": f"Basic {auth_b64}",
+        "Content-Type": "application/x-www-form-urlencoded"
     }
     
-    await db.twitter_accounts.delete_many({"user_id": current_user["id"]})
-    await db.twitter_accounts.insert_one(twitter_account_doc)
-    await db.twitter_temp_tokens.delete_many({"oauth_token": oauth_token})
+    data = {
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": callback_url,
+        "code_verifier": code_verifier
+    }
     
-    return TwitterAccountResponse(
-        twitter_id=twitter_account_doc["twitter_id"],
-        screen_name=twitter_account_doc["screen_name"],
-        name=twitter_account_doc["name"],
-        profile_image_url=twitter_account_doc["profile_image_url"],
-        connected_at=twitter_account_doc["connected_at"]
-    )
+    try:
+        token_response = requests.post(token_url, headers=headers, data=data)
+        
+        if token_response.status_code != 200:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Failed to get access token: {token_response.text}"
+            )
+        
+        token_data = token_response.json()
+        access_token = token_data.get('access_token')
+        refresh_token = token_data.get('refresh_token')
+        
+        # Get user information using the access token
+        user_info_headers = {
+            "Authorization": f"Bearer {access_token}"
+        }
+        
+        user_info_response = requests.get(
+            "https://api.twitter.com/2/users/me?user.fields=profile_image_url",
+            headers=user_info_headers
+        )
+        
+        if user_info_response.status_code != 200:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Failed to get user info: {user_info_response.text}"
+            )
+        
+        twitter_user = user_info_response.json()['data']
+        
+        # Store Twitter account info with OAuth 2.0 tokens
+        twitter_account_doc = {
+            "user_id": current_user["id"],
+            "twitter_id": twitter_user['id'],
+            "screen_name": twitter_user['username'],
+            "name": twitter_user['name'],
+            "profile_image_url": twitter_user.get('profile_image_url', ''),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "connected_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        # Replace any existing Twitter account for this user
+        await db.twitter_accounts.delete_many({"user_id": current_user["id"]})
+        await db.twitter_accounts.insert_one(twitter_account_doc)
+        await db.twitter_temp_tokens.delete_many({"user_id": current_user["id"]})
+        
+        return TwitterAccountResponse(
+            twitter_id=twitter_account_doc["twitter_id"],
+            screen_name=twitter_account_doc["screen_name"],
+            name=twitter_account_doc["name"],
+            profile_image_url=twitter_account_doc["profile_image_url"],
+            connected_at=twitter_account_doc["connected_at"]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Twitter OAuth error: {str(e)}")
 
 @api_router.get("/twitter/account", response_model=TwitterAccountResponse)
 async def get_twitter_account(current_user: dict = Depends(get_current_user)):
-    account = await db.twitter_accounts.find_one({"user_id": current_user["id"]}, {"_id": 0, "oauth_token": 0, "oauth_token_secret": 0})
+    account = await db.twitter_accounts.find_one(
+        {"user_id": current_user["id"]}, 
+        {"_id": 0, "access_token": 0, "refresh_token": 0}
+    )
     if not account:
         raise HTTPException(status_code=404, detail="No Twitter account connected")
     
@@ -591,8 +644,7 @@ async def generate_test_post(current_user: dict = Depends(get_current_user)):
         
         try:
             twitter_response = post_tweet_to_twitter(
-                twitter_account['oauth_token'],
-                twitter_account['oauth_token_secret'],
+                twitter_account['access_token'],
                 tweet_text
             )
             
