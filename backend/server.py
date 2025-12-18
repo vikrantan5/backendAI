@@ -604,6 +604,7 @@ async def create_schedule(schedule: ScheduleCreate, current_user: dict = Depends
         "updated_at": now
     }
     
+    
     await db.schedules.delete_many({"user_id": current_user["id"]})
     await db.schedules.insert_one(schedule_doc)
     
