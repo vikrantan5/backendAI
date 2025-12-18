@@ -225,18 +225,29 @@ Rules:
     
     try:
         # Call OpenAI API with GPT-4 model
+        # response = await client.chat.completions.create(
+        #     model="gpt-4",  # Using GPT-4 for high-quality content generation
+        #     messages=[
+        #         {"role": "system", "content": system_message},
+        #         {"role": "user", "content": user_prompt}
+        #     ],
+        #     temperature=0.7,  # Balanced creativity
+        #     max_tokens=100,   # Sufficient for a tweet
+        #     top_p=1.0,
+        #     frequency_penalty=0.5,  # Reduce repetition
+        #     presence_penalty=0.3    # Encourage variety
+        # )
+
         response = await client.chat.completions.create(
-            model="gpt-4",  # Using GPT-4 for high-quality content generation
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.7,  # Balanced creativity
-            max_tokens=100,   # Sufficient for a tweet
-            top_p=1.0,
-            frequency_penalty=0.5,  # Reduce repetition
-            presence_penalty=0.3    # Encourage variety
-        )
+    model="gpt-4.1-mini",
+    messages=[
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_prompt}
+    ],
+    temperature=0.7,
+    max_tokens=120,
+)
+
         
         tweet = response.choices[0].message.content.strip()
         
