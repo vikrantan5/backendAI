@@ -12,9 +12,10 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
-from openai import AsyncOpenAI
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from google import genai
+from google.genai import types
 from apscheduler.triggers.cron import CronTrigger
 import requests
 import hashlib
@@ -69,20 +70,20 @@ api_router = APIRouter(prefix="/api")
 # Initialize scheduler
 scheduler = AsyncIOScheduler()
 
-# Initialize OpenAI client
-openai_client = None
+# Initialize Gemini client
+gemini_client = None
 
-def get_openai_client():
-    global openai_client
-    if openai_client is None:
-        api_key = os.environ.get('OPENAI_API_KEY')
-        if not api_key or api_key == 'your-openai-api-key-here':
+def get_gemini_client():
+    global gemini_client
+    if gemini_client is None:
+        api_key = os.environ.get('GEMINI_API_KEY')
+        if not api_key or api_key == 'your-gemini-api-key-here':
             raise HTTPException(
                 status_code=500, 
-                detail="OpenAI API key not configured. Please set OPENAI_API_KEY in .env file"
+                detail="Gemini API key not configured. Please set GEMINI_API_KEY in .env file"
             )
-        openai_client = AsyncOpenAI(api_key=api_key)
-    return openai_client
+        gemini_client = genai.Client(api_key=api_key)
+    return gemini_client
 
 # ===== Models =====
 class UserCreate(BaseModel):
@@ -195,12 +196,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 # ===== AI Tweet Generation =====
 async def generate_tweet(content_config: dict, user_id: str) -> str:
     """
-    Generate a tweet using OpenAI's API directly.
+    Generate a tweet using Gemini's API.
     
-    This function uses the OpenAI SDK to generate tweets based on user's content configuration.
-    It sends a structured prompt to GPT-4 to create engaging, character-limited tweets.
+    This function uses the Gemini SDK to generate tweets based on user's content configuration.
+    It sends a structured prompt to Gemini to create engaging, character-limited tweets.
     """
-    client = get_openai_client()
+    client = get_gemini_client()
     
     length_map = {
         "short": "50-100 characters",
@@ -208,10 +209,10 @@ async def generate_tweet(content_config: dict, user_id: str) -> str:
         "long": "200-280 characters"
     }
     
-    system_message = "You are an expert social media content creator. Generate engaging tweets that are exactly within Twitter's 280 character limit."
-    
-    user_prompt = f"""Generate a tweet about: {content_config['topic']}
-    
+    prompt = f"""You are an expert social media content creator. Generate an engaging tweet that is exactly within Twitter's 280 character limit.
+
+Generate a tweet about: {content_config['topic']}
+
 Tone: {content_config['tone']}
 Length: {length_map.get(content_config['length'], 'medium')}
 Include hashtags: {'Yes' if content_config.get('hashtags') else 'No'}
@@ -224,32 +225,14 @@ Rules:
 4. Just return the tweet text, nothing else"""
     
     try:
-        # Call OpenAI API with GPT-4 model
-        # response = await client.chat.completions.create(
-        #     model="gpt-4",  # Using GPT-4 for high-quality content generation
-        #     messages=[
-        #         {"role": "system", "content": system_message},
-        #         {"role": "user", "content": user_prompt}
-        #     ],
-        #     temperature=0.7,  # Balanced creativity
-        #     max_tokens=100,   # Sufficient for a tweet
-        #     top_p=1.0,
-        #     frequency_penalty=0.5,  # Reduce repetition
-        #     presence_penalty=0.3    # Encourage variety
-        # )
-
-        response = await client.chat.completions.create(
-    model="gpt-4.1-mini",
-    messages=[
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": user_prompt}
-    ],
-    temperature=0.7,
-    max_tokens=120,
-)
-
+        # Call Gemini API using the new google.genai package
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
         
-        tweet = response.choices[0].message.content.strip()
+        tweet = response.text.strip()
         
         # Remove any quotes that might wrap the tweet
         if tweet.startswith('"') and tweet.endswith('"'):
@@ -264,7 +247,7 @@ Rules:
         return tweet
         
     except Exception as e:
-        logging.error(f"OpenAI API error: {str(e)}")
+        logging.error(f"Gemini API error: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate tweet: {str(e)}"
